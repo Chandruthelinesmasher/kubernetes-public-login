@@ -10,6 +10,7 @@ env:
   CLUSTER_NAME: chandru-eks
   REGION: ${{ secrets.AWS_REGION }}
   NAMESPACE: myapp
+  DEPLOYMENT_NAME: myapp
 
 jobs:
 
@@ -20,17 +21,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 18
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
 
-      - run: |
+      - name: Install dependencies
+        run: |
           cd app
-          npm install
+          npm ci
 
-      - run: echo "No tests configured"
+      - name: Run tests
+        run: |
+          cd app
+          echo "No tests configured yet"
+          # npm test
 
 
 # ==========================================
@@ -41,7 +51,11 @@ jobs:
     needs: test
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Docker login
         uses: docker/login-action@v3
@@ -49,13 +63,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build
-        run: |
-          cd app
-          docker build -t $IMAGE_NAME:latest .
-
-      - name: Push
-        run: docker push $IMAGE_NAME:latest
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:latest
+          cache-to: type=inline
 
 
 # ==========================================
@@ -66,9 +83,13 @@ jobs:
     needs: build
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
 
       - name: AWS Login
         uses: aws-actions/configure-aws-credentials@v4
@@ -77,15 +98,35 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Terraform Format Check
+        run: |
+          cd eks-terraform
+          terraform fmt -check || true
+
       - name: Terraform Init
         run: |
           cd eks-terraform
           terraform init
 
+      - name: Terraform Validate
+        run: |
+          cd eks-terraform
+          terraform validate
+
+      - name: Terraform Plan
+        run: |
+          cd eks-terraform
+          terraform plan -out=tfplan
+
       - name: Terraform Apply
         run: |
           cd eks-terraform
-          terraform apply -auto-approve
+          terraform apply -auto-approve tfplan
+
+      - name: Wait for EKS cluster to be ready
+        run: |
+          echo "Waiting for EKS cluster to be fully ready..."
+          sleep 30
 
 
 # ==========================================
@@ -96,7 +137,8 @@ jobs:
     needs: infra
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: AWS Login
         uses: aws-actions/configure-aws-credentials@v4
@@ -105,21 +147,108 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Connect to Cluster
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to EKS Cluster
         run: |
           aws eks update-kubeconfig --name $CLUSTER_NAME --region $REGION
-
-      - name: Deploy manifests
+          
+      - name: Verify cluster connection
         run: |
+          echo "Verifying cluster connection..."
+          kubectl cluster-info
+          kubectl get nodes
+          echo "Cluster connection successful!"
+
+      - name: Create namespace
+        run: |
+          echo "Creating/verifying namespace: $NAMESPACE"
           kubectl apply -f k8s/namespace.yaml
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service.yaml
-          kubectl apply -f k8s/ingress.yaml
+          kubectl get namespace $NAMESPACE
 
-      - name: Restart for new image
+      - name: Validate Kubernetes manifests
         run: |
-          kubectl rollout restart deployment myapp -n $NAMESPACE
+          echo "Validating Kubernetes manifests..."
+          kubectl apply --dry-run=client -f k8s/deployment.yaml
+          kubectl apply --dry-run=client -f k8s/service.yaml
+          kubectl apply --dry-run=client -f k8s/ingress.yaml
+          echo "Manifests validation successful!"
 
-      - name: Show ingress
+      - name: Deploy application
         run: |
-          kubectl get svc -n ingress-nginx
+          echo "Deploying application to namespace: $NAMESPACE"
+          kubectl apply -f k8s/deployment.yaml -n $NAMESPACE
+          kubectl apply -f k8s/service.yaml -n $NAMESPACE
+
+      - name: Wait for deployment to be ready
+        run: |
+          echo "Waiting for deployment to be ready..."
+          kubectl rollout status deployment/$DEPLOYMENT_NAME -n $NAMESPACE --timeout=5m
+
+      - name: Update deployment with latest image
+        run: |
+          echo "Updating deployment with latest image..."
+          kubectl set image deployment/$DEPLOYMENT_NAME \
+            $DEPLOYMENT_NAME=$IMAGE_NAME:${{ github.sha }} \
+            -n $NAMESPACE
+          kubectl rollout status deployment/$DEPLOYMENT_NAME -n $NAMESPACE --timeout=5m
+
+      - name: Install/Verify Ingress Controller
+        run: |
+          echo "Checking for ingress-nginx controller..."
+          if ! kubectl get namespace ingress-nginx &> /dev/null; then
+            echo "Installing ingress-nginx controller..."
+            kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.9.5/deploy/static/provider/cloud/deploy.yaml
+            echo "Waiting for ingress controller to be ready..."
+            kubectl wait --namespace ingress-nginx \
+              --for=condition=ready pod \
+              --selector=app.kubernetes.io/component=controller \
+              --timeout=300s
+          else
+            echo "Ingress controller already installed"
+          fi
+
+      - name: Deploy ingress
+        run: |
+          echo "Deploying ingress..."
+          kubectl apply -f k8s/ingress.yaml -n $NAMESPACE
+          sleep 10
+
+      - name: Get deployment status
+        run: |
+          echo "=========================================="
+          echo "DEPLOYMENT STATUS"
+          echo "=========================================="
+          kubectl get all -n $NAMESPACE
+          echo ""
+          echo "=========================================="
+          echo "INGRESS INFORMATION"
+          echo "=========================================="
+          kubectl get ingress -n $NAMESPACE || echo "No ingress found in namespace"
+          echo ""
+          echo "=========================================="
+          echo "INGRESS CONTROLLER SERVICE"
+          echo "=========================================="
+          kubectl get svc -n ingress-nginx || echo "Ingress controller not found"
+          echo ""
+          echo "=========================================="
+          echo "POD LOGS (Last 20 lines)"
+          echo "=========================================="
+          kubectl logs -n $NAMESPACE -l app=$DEPLOYMENT_NAME --tail=20 || echo "No logs available yet"
+
+      - name: Show application endpoint
+        run: |
+          echo "=========================================="
+          echo "APPLICATION ENDPOINTS"
+          echo "=========================================="
+          INGRESS_IP=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+          if [ "$INGRESS_IP" = "pending" ] || [ -z "$INGRESS_IP" ]; then
+            INGRESS_IP=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "LoadBalancer IP still pending...")
+          fi
+          echo "Ingress LoadBalancer: $INGRESS_IP"
+          echo "Wait a few minutes for DNS propagation if using AWS LoadBalancer"
+          echo "=========================================="
