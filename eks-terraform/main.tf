@@ -34,8 +34,8 @@ module "eks" {
   # Enable public access to cluster endpoint
   cluster_endpoint_public_access = true
 
-  # Grant access to anyone in this AWS account (temporary fix)
-  enable_irsa = true
+  # Disable IRSA to avoid the OIDC provider error
+  enable_irsa = false
 
   eks_managed_node_groups = {
     default = {
@@ -62,6 +62,3 @@ module "eks" {
     }
   }
 }
-
-
-
