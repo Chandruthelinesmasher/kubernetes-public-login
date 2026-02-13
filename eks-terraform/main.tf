@@ -13,6 +13,8 @@ module "vpc" {
   single_nat_gateway = true
 }
 
+data "aws_caller_identity" "current" {}
+
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "20.8.4"
@@ -32,6 +34,9 @@ module "eks" {
   # Enable public access to cluster endpoint
   cluster_endpoint_public_access = true
 
+  # Grant access to anyone in this AWS account (temporary fix)
+  enable_irsa = true
+
   eks_managed_node_groups = {
     default = {
       instance_types = ["t3.medium"]
@@ -40,4 +45,23 @@ module "eks" {
       desired_size   = 1
     }
   }
-}cd 
+
+  # Add access entries for the current AWS account root
+  access_entries = {
+    admin = {
+      principal_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+      
+      policy_associations = {
+        admin = {
+          policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          access_scope = {
+            type = "cluster"
+          }
+        }
+      }
+    }
+  }
+}
+
+
+
