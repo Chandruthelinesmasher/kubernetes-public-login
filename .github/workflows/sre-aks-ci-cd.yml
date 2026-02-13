@@ -4,6 +4,17 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      terraform_action:
+        description: 'Run Terraform? (skip/apply/destroy)'
+        required: false
+        type: choice
+        default: 'skip'
+        options:
+          - skip
+          - apply
+          - destroy
 
 env:
   IMAGE_NAME: chandrulinesmasher/mysampleappv1
@@ -15,10 +26,59 @@ env:
 jobs:
 
 # ==========================================
+# STAGE 0 – INFRASTRUCTURE (OPTIONAL)
+# ==========================================
+  infrastructure:
+    runs-on: ubuntu-latest
+    if: github.event.inputs.terraform_action != 'skip' && github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+      
+      - name: AWS Login
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Terraform Init
+        run: |
+          cd eks-terraform
+          terraform init
+      
+      - name: Terraform Apply
+        if: github.event.inputs.terraform_action == 'apply'
+        run: |
+          cd eks-terraform
+          terraform apply -auto-approve
+      
+      - name: Wait for cluster
+        if: github.event.inputs.terraform_action == 'apply'
+        run: |
+          echo "Waiting for cluster to be active..."
+          aws eks wait cluster-active --name $CLUSTER_NAME --region $REGION
+          echo "✅ Cluster is ready!"
+      
+      - name: Terraform Destroy
+        if: github.event.inputs.terraform_action == 'destroy'
+        run: |
+          cd eks-terraform
+          terraform destroy -auto-approve
+
+# ==========================================
 # STAGE 1 – TEST
 # ==========================================
   test:
     runs-on: ubuntu-latest
+    needs: [infrastructure]
+    if: always() && (needs.infrastructure.result == 'success' || needs.infrastructure.result == 'skipped')
 
     steps:
       - name: Checkout code
@@ -76,7 +136,7 @@ jobs:
 
 
 # ==========================================
-# STAGE 3 – DEPLOY TO EKS (NO INFRA CHANGES)
+# STAGE 3 – DEPLOY TO EKS
 # ==========================================
   deploy:
     runs-on: ubuntu-latest
@@ -109,7 +169,7 @@ jobs:
           else
             echo "exists=false" >> $GITHUB_OUTPUT
             echo "❌ EKS cluster '$CLUSTER_NAME' does not exist"
-            echo "Please create the cluster first using Terraform locally or manually"
+            echo "Please create the cluster first by running this workflow manually with 'apply' option"
             exit 1
           fi
 
@@ -184,7 +244,7 @@ jobs:
           sleep 10
 
       - name: Get deployment status
-        if: always()
+        if: always() && steps.check_cluster.outputs.exists == 'true'
         run: |
           echo "=========================================="
           echo "📊 DEPLOYMENT STATUS"
@@ -207,6 +267,7 @@ jobs:
           kubectl logs -n $NAMESPACE -l app=$DEPLOYMENT_NAME --tail=20 || echo "No logs available yet"
 
       - name: Show application endpoint
+        if: steps.check_cluster.outputs.exists == 'true'
         run: |
           echo "=========================================="
           echo "🚀 APPLICATION ENDPOINTS"

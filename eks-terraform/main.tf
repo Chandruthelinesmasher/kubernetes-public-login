@@ -15,6 +15,7 @@ module "vpc" {
 
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
+  version = "20.8.4"
 
   cluster_name    = var.cluster_name
   cluster_version = "1.29"
@@ -22,8 +23,13 @@ module "eks" {
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
 
+  # Enable cluster creator admin permissions
+  enable_cluster_creator_admin_permissions = true
   
+  # Use API_AND_CONFIG_MAP mode for better compatibility
+  authentication_mode = "API_AND_CONFIG_MAP"
   
+  # Enable public access to cluster endpoint
   cluster_endpoint_public_access = true
 
   eks_managed_node_groups = {
@@ -34,5 +40,4 @@ module "eks" {
       desired_size   = 1
     }
   }
-}
-
+}cd 
